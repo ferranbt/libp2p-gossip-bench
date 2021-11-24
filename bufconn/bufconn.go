@@ -92,6 +92,15 @@ func (l *Listener) Dial(n support.Network) (net.Conn, error) {
 	return l.DialContext(context.Background(), n)
 }
 
+type pipe2 struct {
+	net.Conn
+	pipe *pipe
+}
+
+func (p *pipe2) Close() error {
+	panic("err")
+}
+
 // DialContext creates an in-memory full-duplex network connection, unblocks Accept by
 // providing it the server half of the connection, and returns the client half
 // of the connection.  If ctx is Done, returns ctx.Err()
@@ -106,6 +115,7 @@ func (l *Listener) DialContext(ctx context.Context, n support.Network) (net.Conn
 		if conn1, err = n.Conn(p1); err != nil {
 			panic(err)
 		}
+		conn1 = &pipe2{conn1, p1}
 		doneCh <- struct{}{}
 	}()
 
@@ -114,6 +124,7 @@ func (l *Listener) DialContext(ctx context.Context, n support.Network) (net.Conn
 		if conn2, err = n.Conn(p2); err != nil {
 			panic(err)
 		}
+		conn2 = &pipe2{conn2, p2}
 		doneCh <- struct{}{}
 	}()
 
@@ -300,8 +311,8 @@ type conn struct {
 }
 
 func (c *conn) Close() error {
-	err1 := c.Reader.(*pipe).Close()
-	err2 := c.Writer.(*pipe).closeWrite()
+	err1 := c.Reader.(*pipe2).pipe.Close()
+	err2 := c.Writer.(*pipe2).pipe.closeWrite()
 	if err1 != nil {
 		return err1
 	}

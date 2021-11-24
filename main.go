@@ -1,20 +1,25 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ferranbt/libp2p-gossip-bench/latency"
 	"github.com/ferranbt/libp2p-gossip-bench/network"
 	"github.com/ferranbt/libp2p-gossip-bench/proto"
 	"github.com/ferranbt/libp2p-gossip-bench/support"
+	"github.com/golang/protobuf/ptypes/any"
 	"github.com/hashicorp/go-hclog"
 
 	ma "github.com/multiformats/go-multiaddr"
@@ -23,34 +28,109 @@ import (
 func main() {
 	rand.Seed(time.Now().Unix())
 
+	size := 200
+	gossipSize := 100
+	msgSize := 1024
+	maxPeers := 10
+
 	m := &Mesh{
-		latency: readLatency(),
-		logger:  hclog.New(&hclog.LoggerOptions{Output: os.Stdout}),
-		port:    30000,
+		latency:  readLatency(),
+		logger:   hclog.New(&hclog.LoggerOptions{Output: os.Stdout}),
+		port:     30000,
+		maxPeers: maxPeers,
 	}
 	m.manager = &latency.Manager{
 		QueryNetwork: m.queryLatencies,
 	}
 
-	defer m.Stop()
+	for i := 0; i < size; i++ {
+		m.runServer("srv_" + strconv.Itoa(i))
+	}
 
-	m.runServer("a")
-	m.runServer("b")
+	// join them in a line
+	var wg sync.WaitGroup
+	for i := 0; i < size-1; i++ {
+		wg.Add(1)
 
-	m.join("a", "b")
-	m.gossip("a")
+		go func(i int) {
+			m.join("srv_"+strconv.Itoa(i), "srv_"+strconv.Itoa(i+1))
+			wg.Done()
+		}(i)
+	}
+	wg.Wait()
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(1 * time.Minute)
+
+	// m.waitForPeers(3)
+
+	for i := 0; i < gossipSize; i++ {
+		m.gossip("srv_"+strconv.Itoa(i), msgSize)
+	}
+	for i := 0; i < gossipSize; i++ {
+		m.gossip("srv_"+strconv.Itoa(i), msgSize)
+	}
+
+	time.Sleep(1 * time.Second)
+
+	compute := func(show bool) {
+		total := 0
+		for _, p := range m.servers {
+			if show {
+				fmt.Println(p.city, p.numTopics(), p.NumPeers())
+			}
+			total += p.numTopics()
+		}
+		fmt.Println(total / len(m.servers))
+	}
+
+	compute(false)
+
+	time.Sleep(1 * time.Second)
+
+	compute(false)
+
+	time.Sleep(1 * time.Second)
+
+	compute(false)
+
+	// 50 nodos, full, 1 second 95%
+	//
+	// handleSignals()
+}
+
+func handleSignals() {
+	signalCh := make(chan os.Signal, 4)
+	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+
+	<-signalCh
+	os.Exit(0)
 }
 
 type Mesh struct {
 	lock sync.Mutex
 
-	latency *LatencyData
-	logger  hclog.Logger
-	servers map[string]*server
-	port    int
-	manager *latency.Manager
+	latency  *LatencyData
+	logger   hclog.Logger
+	servers  map[string]*server
+	port     int
+	manager  *latency.Manager
+	maxPeers int
+}
+
+func (m *Mesh) waitForPeers(min int64) {
+	check := func() bool {
+		for _, p := range m.servers {
+			if p.NumPeers() < min {
+				return false
+			}
+		}
+		return true
+	}
+	for {
+		if check() {
+			return
+		}
+	}
 }
 
 func (m *Mesh) findPeerByPort(port string) *server {
@@ -88,8 +168,16 @@ func (m *Mesh) queryLatencies(laddr, raddr ma.Multiaddr) support.Network {
 	return nn
 }
 
-func (m *Mesh) gossip(from string) {
-	m.servers[from].topic.Publish(&proto.Txn{})
+func (m *Mesh) gossip(from string, size int) {
+	buf := make([]byte, size)
+	rand.Read(buf)
+
+	m.servers[from].topic.Publish(&proto.Txn{
+		From: from,
+		Raw: &any.Any{
+			Value: buf,
+		},
+	})
 }
 
 func (m *Mesh) join(fromID, toID string) error {
@@ -103,15 +191,18 @@ func (m *Mesh) runServer(name string) error {
 		m.servers = map[string]*server{}
 	}
 
+	n := rand.Int() % len(m.latency.SourcesList)
+	city := m.latency.SourcesList[n].Name
+
 	config := network.DefaultConfig()
 	config.Transport = m.manager.Transport()
+	config.City = city
+	config.MaxPeers = uint64(m.maxPeers)
 
 	config.Addr = &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: m.port}
 	m.port++
 
-	n := rand.Int() % len(m.latency.SourcesList)
-
-	m.servers[name] = newServer(m.logger.Named(name), config, m.latency.SourcesList[n].Name)
+	m.servers[name] = newServer(m.logger.Named(name), config, city)
 	return nil
 }
 
@@ -128,6 +219,9 @@ type server struct {
 
 	topic *network.Topic
 
+	topicsLock sync.Mutex
+	topics     map[string]struct{}
+
 	city string
 }
 
@@ -142,16 +236,30 @@ func newServer(logger hclog.Logger, config *network.Config, city string) *server
 	if err != nil {
 		panic(err)
 	}
-	topic.Subscribe(func(obj interface{}) {
-		fmt.Println("- topic -")
-	})
 
-	return &server{
+	s := &server{
 		config: config,
 		Server: srv,
 		topic:  topic,
 		city:   city,
+		topics: map[string]struct{}{},
 	}
+	topic.Subscribe(func(obj interface{}) {
+		s.topicsLock.Lock()
+		defer s.topicsLock.Unlock()
+
+		msg := obj.(*proto.Txn)
+		hash := hashit(msg.Raw.Value)
+		s.topics[hash] = struct{}{}
+	})
+	return s
+}
+
+func (s *server) numTopics() int {
+	s.topicsLock.Lock()
+	defer s.topicsLock.Unlock()
+
+	return len(s.topics)
 }
 
 // read latencies
@@ -194,4 +302,11 @@ func readLatency() *LatencyData {
 		latencyData.sources[i.Name] = i.Id
 	}
 	return &latencyData
+}
+
+func hashit(b []byte) string {
+	h := sha256.New()
+	h.Write(b)
+	dst := h.Sum(nil)
+	return hex.EncodeToString(dst)
 }

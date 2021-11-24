@@ -46,11 +46,12 @@ func (m *Manager) findRemote(raddr ma.Multiaddr) *Transport {
 	defer m.lock.Unlock()
 
 	for _, t := range m.transports {
-		if t.laddr == raddr {
+		if t.laddr.Equal(raddr) {
 			return t
 		}
 	}
-	return nil
+
+	panic("not found")
 }
 
 func (m *Manager) Transport() config.TptC {

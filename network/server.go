@@ -28,6 +28,7 @@ const DefaultLibp2pPort int = 1478
 const MinimumPeerConnections int64 = 1
 
 type Config struct {
+	City       string
 	NoDiscover bool
 	Addr       *net.TCPAddr
 	NatAddr    net.IP
@@ -144,7 +145,7 @@ func NewServer(logger hclog.Logger, config *Config) (*Server, error) {
 
 	go srv.runDial()
 	go srv.checkPeerConnections()
-	logger.Info("LibP2P server running", "addr", AddrInfoToString(srv.AddrInfo()))
+	logger.Info("LibP2P server running", "addr", AddrInfoToString(srv.AddrInfo()), "city", srv.config.City)
 
 	if !config.NoDiscover {
 		// start discovery
@@ -199,7 +200,7 @@ func (s *Server) checkPeerConnections() {
 		case <-s.closeCh:
 			return
 		}
-		if s.numPeers() < MinimumPeerConnections {
+		if s.NumPeers() < MinimumPeerConnections {
 			if s.config.NoDiscover || len(s.discovery.bootnodes) == 0 {
 				//TODO: dial peers from the peerstore
 			} else {
@@ -271,11 +272,12 @@ func (s *Server) runDial() {
 	}
 }
 
-func (s *Server) numPeers() int64 {
+func (s *Server) NumPeers() int64 {
 	s.peersLock.Lock()
 	defer s.peersLock.Unlock()
 	return int64(len(s.peers))
 }
+
 func (s *Server) getRandomBootNode() *peer.AddrInfo {
 
 	return s.discovery.bootnodes[rand.Intn(len(s.discovery.bootnodes))]
@@ -293,7 +295,7 @@ func (s *Server) Peers() []*Peer {
 }
 
 func (s *Server) numOpenSlots() int64 {
-	n := int64(s.config.MaxPeers) - (s.numPeers() + s.identity.numPending())
+	n := int64(s.config.MaxPeers) - (s.NumPeers() + s.identity.numPending())
 	if n < 0 {
 		n = 0
 	}
@@ -348,6 +350,7 @@ func (s *Server) delPeer(id peer.ID) {
 func (s *Server) Disconnect(peer peer.ID, reason string) {
 	if s.host.Network().Connectedness(peer) == network.Connected {
 		// send some close message
+		s.logger.Info("Disconnect peer", "id", peer.Pretty(), "reason", reason)
 		s.host.Network().ClosePeer(peer)
 	}
 }
